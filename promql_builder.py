@@ -46,6 +46,17 @@ class Function:
             result += f" without ({', '.join(self.without)})"
         return result
 
+@dataclass
+class ArithmeticOperation:
+    operator: str
+    value: Union[str, float, 'MetricSelector', 'Function']
+    is_scalar: bool = True
+
+    def __str__(self) -> str:
+        if self.is_scalar:
+            return f"{self.operator} {self.value}"
+        return f"{self.operator} {str(self.value)}"
+
 class QueryParser:
     @staticmethod
     def parse_label_matchers(label_str: str) -> List[LabelMatcher]:
@@ -95,11 +106,22 @@ class QueryParser:
         
         return range_window, offset
 
+    @staticmethod
+    def parse_arithmetic_operation(expr: str) -> Tuple[Optional[str], Optional[Union[str, float]]]:
+        """Parse arithmetic operation from expression."""
+        # Match arithmetic operators and their operands
+        op_match = re.match(r'\((.*?)\)\s*([+\-*/%^])\s*(\d+(?:\.\d+)?)', expr)
+        if not op_match:
+            return None, None
+        
+        return op_match.group(2), float(op_match.group(3))
+
 class PromQLBuilder:
     def __init__(self, query: Optional[str] = None):
         self.metric: Optional[MetricSelector] = None
         self.functions: List[Function] = []
         self.binary_ops: List[tuple[str, Union[str, float]]] = []
+        self.arithmetic_ops: List[ArithmeticOperation] = []
         
         if query:
             self._parse_query(query)
@@ -111,6 +133,14 @@ class PromQLBuilder:
         if binary_op_match:
             query = binary_op_match.group(1)
             self.binary_ops.append((binary_op_match.group(2), float(binary_op_match.group(3))))
+
+        # Handle arithmetic operations
+        while True:
+            op, value = QueryParser.parse_arithmetic_operation(query)
+            if not op:
+                break
+            self.arithmetic_ops.append(ArithmeticOperation(op, value))
+            query = query[query.find("(")+1:query.find(")")]
 
         # Handle functions
         while True:
@@ -215,6 +245,16 @@ class PromQLBuilder:
         self.binary_ops.append((operator, value))
         return self
 
+    def with_arithmetic_op(self, operator: str, value: Union[str, float, MetricSelector, Function]) -> 'PromQLBuilder':
+        """Add an arithmetic operation."""
+        valid_ops = ["+", "-", "*", "/", "%", "^"]
+        if operator not in valid_ops:
+            raise ValueError(f"Invalid operator: {operator}")
+        
+        is_scalar = isinstance(value, (str, float)) or (isinstance(value, str) and value.replace('.', '').isdigit())
+        self.arithmetic_ops.append(ArithmeticOperation(operator, value, is_scalar))
+        return self
+
     def remove_label(self, name: str) -> 'PromQLBuilder':
         """Remove a label matcher."""
         if not self.metric:
@@ -231,6 +271,12 @@ class PromQLBuilder:
         """Remove the last binary operation."""
         if self.binary_ops:
             self.binary_ops.pop()
+        return self
+
+    def remove_arithmetic_op(self) -> 'PromQLBuilder':
+        """Remove the last arithmetic operation."""
+        if self.arithmetic_ops:
+            self.arithmetic_ops.pop()
         return self
 
     def remove_range(self) -> 'PromQLBuilder':
@@ -262,6 +308,10 @@ class PromQLBuilder:
                 # Replace any placeholder with the current expression
                 args = [str(arg).replace("$expr", expr) for arg in func.args]
                 expr = str(Function(func.name, args, func.group_by, func.without))
+
+        # Apply arithmetic operations
+        for op in self.arithmetic_ops:
+            expr = f"({expr} {op})"
 
         # Apply binary operations
         for op, value in self.binary_ops:
@@ -316,4 +366,16 @@ if __name__ == "__main__":
                       .remove_label("method")
                       .remove_label("path")
                       .build())
-    print("\nQuery after removing labels:", modified_query3) 
+    print("\nQuery after removing labels:", modified_query3)
+
+    print("--------------------------------")
+
+    # Example 4: Arithmetic operations
+    query = (PromQLBuilder()
+        .with_metric("http_requests_total")
+        .with_label("status", "200")
+        .with_rate("5m")
+        .with_arithmetic_op("*", 2)
+        .with_arithmetic_op("+", 100)
+        .build())
+    print("\nQuery with arithmetic operations:", query) 
