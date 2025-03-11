@@ -81,19 +81,34 @@ class QueryParser:
         return matchers
 
     @staticmethod
-    def parse_function(func_str: str) -> Tuple[str, List[str], List[str]]:
+    def parse_function(func_str: str) -> Tuple[str, List[str], List[str], List[str]]:
         """Parse function and its grouping."""
-        # Match function name and arguments
-        func_match = re.match(r'(\w+)\((.*?)\)(?:\s+by\s+\((.*?)\)|\s+without\s+\((.*?)\))?', func_str)
+        # Match function name, arguments, and by/without clauses with improved regex
+        func_match = re.match(
+            r'(?P<func>\w+)\s*\(\s*(?P<args>.*?)\s*\)'
+            r'(?:\s+(?P<grouping>by|without)\s+\((?P<labels>[^)]*)\))?',
+            func_str,
+            re.DOTALL
+        )
+        
         if not func_match:
-            return None, [], []
+            return None, [], [], []
         
-        name = func_match.group(1)
-        args = [arg.strip() for arg in func_match.group(2).split(",")] if func_match.group(2) else []
-        by_labels = [l.strip() for l in func_match.group(3).split(",")] if func_match.group(3) else []
-        without_labels = [l.strip() for l in func_match.group(4).split(",")] if func_match.group(4) else []
+        match_dict = func_match.groupdict()
+        name = match_dict['func']
+        args = [arg.strip() for arg in match_dict['args'].split(",")] if match_dict['args'] else []
         
-        return name, args, by_labels if by_labels else without_labels
+        # Handle by/without clauses
+        group_type = match_dict['grouping']
+        group_labels = []
+        if group_type and match_dict['labels']:
+            group_labels = [l.strip() for l in match_dict['labels'].split(",")]
+        
+        # Return appropriate lists for by and without
+        by_labels = group_labels if group_type == "by" else []
+        without_labels = group_labels if group_type == "without" else []
+        
+        return name, args, by_labels, without_labels
 
     @staticmethod
     def parse_range_and_offset(metric_str: str) -> Tuple[Optional[str], Optional[str]]:
@@ -142,46 +157,75 @@ class PromQLBuilder:
             self.arithmetic_ops.append(ArithmeticOperation(op, value))
             query = query[query.find("(")+1:query.find(")")]
 
-        # Handle functions
+        # Handle functions and aggregations
         while True:
-            func_match = re.match(r'(\w+)\((.*)\)', query)
+            # Match function with potential by/without clause
+            # Updated regex to better handle aggregation operators and their clauses
+            func_match = re.match(
+                r'(?P<func>\w+)\s*\(\s*(?P<content>.*?)\s*\)'
+                r'(?:\s+(?P<grouping>by|without)\s+\((?P<labels>[^)]*)\))?',
+                query,
+                re.DOTALL
+            )
+            
             if not func_match:
                 break
             
-            func_name = func_match.group(1)
-            func_content = func_match.group(2)
-            
-            # Parse function and its grouping
-            name, args, group_labels = QueryParser.parse_function(f"{func_name}({func_content})")
-            if name:
-                func = Function(name, ["$expr"], group_labels)
-                self.functions.insert(0, func)
-                
-                # If it's a rate function, extract the range window
-                if name == "rate":
-                    range_match = re.search(r'\[(\d+[smhdwy])\]', func_content)
-                    if range_match:
-                        if not self.metric:
-                            self.metric = MetricSelector("")
-                        self.metric.range_window = range_match.group(1)
-            
+            func_dict = func_match.groupdict()
+            func_name = func_dict['func']
+            func_content = func_dict['content']
+            grouping_type = func_dict['grouping']
+            grouping_labels = func_dict['labels']
+
+            # Process grouping labels
+            by_labels = []
+            without_labels = []
+            if grouping_labels:
+                labels = [l.strip() for l in grouping_labels.split(',')]
+                if grouping_type == 'by':
+                    by_labels = labels
+                else:
+                    without_labels = labels
+
+            # For rate function, extract range window from the inner content
+            if func_name == "rate":
+                range_match = re.search(r'\[(\d+[smhdwy])\]', func_content)
+                if range_match:
+                    if not self.metric:
+                        self.metric = MetricSelector("")
+                    self.metric.range_window = range_match.group(1)
+
+            # Create function with proper grouping
+            func = Function(func_name, ["$expr"], by_labels, without_labels)
+            self.functions.insert(0, func)
+
             # Update query to process next function
             query = func_content
 
         # Parse metric and labels
-        metric_match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)\{?(.*?)\}?(?:\[.*?\])?(?:\s+offset.*)?$', query)
+        # Updated regex to better handle metric names and label matchers
+        metric_match = re.match(
+            r'(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'  # metric name
+            r'(?:\{(?P<labels>.*?)\})?'  # optional labels
+            r'(?:\[(?P<range>[^]]+)\])?'  # optional range
+            r'(?:\s+offset\s+(?P<offset>\w+))?$',  # optional offset
+            query
+        )
+
         if metric_match:
-            metric_name = metric_match.group(1)
-            label_str = metric_match.group(2)
-            
+            match_dict = metric_match.groupdict()
+            metric_name = match_dict['metric']
+            label_str = match_dict['labels'] or ""
+            range_str = match_dict['range']
+            offset_str = match_dict['offset']
+
             self.metric = MetricSelector(metric_name)
             if label_str:
                 self.metric.labels = QueryParser.parse_label_matchers(f"{{{label_str}}}")
-            
-            # Parse range window and offset
-            range_window, offset = QueryParser.parse_range_and_offset(query)
-            self.metric.range_window = range_window
-            self.metric.offset = offset
+            if range_str:
+                self.metric.range_window = range_str
+            if offset_str:
+                self.metric.offset = offset_str
 
     @staticmethod
     def parse_duration(duration: str) -> str:
@@ -378,4 +422,27 @@ if __name__ == "__main__":
         .with_arithmetic_op("*", 2)
         .with_arithmetic_op("+", 100)
         .build())
-    print("\nQuery with arithmetic operations:", query) 
+    print("\nQuery with arithmetic operations:", query)
+
+    print("--------------------------------")
+    
+    # Example 5: Complex aggregation queries
+    complex_queries = [
+        'sum(rate(http_requests_total{status="500"}[5m])) by (method)',
+        'avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)',
+        'sum by (job) (rate(http_requests_total{code=~"5.."}[5m]))',
+        'max without (instance) (rate(node_cpu_seconds_total{mode!="idle"}[5m]))',
+        'sum(rate(container_cpu_usage_seconds_total{container!=""}[5m])) by (container, pod)',
+        'sum by (instance, mode) (rate(node_cpu_seconds_total{mode!="idle"}[5m]))',
+        'avg without (instance) (rate(node_memory_MemAvailable_bytes[5m]))',
+        'topk(5, sum(rate(http_requests_total[5m])) by (path))'
+    ]
+    
+    print("\nTesting complex query parsing:")
+    for query in complex_queries:
+        print(f"\nOriginal query: {query}")
+        builder = PromQLBuilder(query)
+        rebuilt = builder.build()
+        print(f"Rebuilt query:  {rebuilt}")
+        if query != rebuilt:
+            print("WARNING: Queries don't match exactly!") 
