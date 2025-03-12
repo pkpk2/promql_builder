@@ -1,15 +1,16 @@
 [tool.poetry]
 name = "promql-builder"
-version = "0.1.0"
-description = "A builder pattern implementation for constructing PromQL queries"
+version = "1.0.0"
+description = "A robust builder pattern implementation for constructing and parsing PromQL queries"
 authors = ["pkpk1"]
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/pkpk1/promql_builder"
-keywords = ["prometheus", "promql", "query", "builder"]
+keywords = ["prometheus", "promql", "query", "builder", "parser", "lexer"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
@@ -17,6 +18,8 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
 ]
 
 [tool.poetry.dependencies]

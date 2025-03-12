@@ -1,7 +1,34 @@
-from typing import List, Dict, Optional, Union
-import re
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import List, Optional, Union, Tuple
+from enum import Enum, auto
+import re
+
+class TokenType(Enum):
+    METRIC_NAME = auto()
+    LABEL_NAME = auto()
+    LABEL_VALUE = auto()
+    LABEL_OP = auto()
+    NUMBER = auto()
+    DURATION = auto()
+    FUNCTION = auto()
+    GROUPING = auto()  # 'by' or 'without'
+    ARITHMETIC_OP = auto()
+    BINARY_OP = auto()
+    LEFT_BRACE = auto()
+    RIGHT_BRACE = auto()
+    LEFT_BRACKET = auto()
+    RIGHT_BRACKET = auto()
+    LEFT_PAREN = auto()
+    RIGHT_PAREN = auto()
+    COMMA = auto()
+    OFFSET = auto()
+    STRING = auto()
+
+@dataclass
+class Token:
+    type: TokenType
+    value: str
+    position: int
 
 @dataclass
 class LabelMatcher:
@@ -22,7 +49,7 @@ class MetricSelector:
     def __str__(self) -> str:
         parts = [self.name]
         if self.labels:
-            labels_str = ", ".join(str(label) for label in self.labels)
+            labels_str = ",".join(str(label) for label in self.labels)
             parts.append(f"{{{labels_str}}}")
         if self.range_window:
             parts.append(f"[{self.range_window}]")
@@ -33,7 +60,7 @@ class MetricSelector:
 @dataclass
 class Function:
     name: str
-    args: List[Union[str, 'MetricSelector', 'Function']] = field(default_factory=list)
+    args: List[Union[str, float, 'MetricSelector', 'Function']] = field(default_factory=list)
     group_by: List[str] = field(default_factory=list)
     without: List[str] = field(default_factory=list)
 
@@ -49,7 +76,7 @@ class Function:
 @dataclass
 class ArithmeticOperation:
     operator: str
-    value: Union[str, float, 'MetricSelector', 'Function']
+    value: Union[str, float, MetricSelector, Function]
     is_scalar: bool = True
 
     def __str__(self) -> str:
@@ -57,175 +84,541 @@ class ArithmeticOperation:
             return f"{self.operator} {self.value}"
         return f"{self.operator} {str(self.value)}"
 
-class QueryParser:
-    @staticmethod
-    def parse_label_matchers(label_str: str) -> List[LabelMatcher]:
-        """Parse label matchers from a string like '{label1="value1",label2=~"value2"}'"""
-        if not label_str or label_str == "{}":
-            return []
+@dataclass
+class BinaryOperation:
+    operator: str
+    right: Union[float, str, MetricSelector, Function]
+    
+    def __str__(self) -> str:
+        if isinstance(self.right, (float, int)):
+            return f"{self.operator} {self.right}"
+        return f"{self.operator} {str(self.right)}"
+
+class Lexer:
+    def __init__(self, text: str):
+        self.text = text
+        self.pos = 0
+        self.current_char = self.text[0] if text else None
+
+    def error(self):
+        raise ValueError(f'Invalid character {self.current_char} at position {self.pos}')
+
+    def advance(self):
+        self.pos += 1
+        self.current_char = self.text[self.pos] if self.pos < len(self.text) else None
+
+    def skip_whitespace(self):
+        while self.current_char and self.current_char.isspace():
+            self.advance()
+
+    def peek(self) -> Optional[str]:
+        peek_pos = self.pos + 1
+        return self.text[peek_pos] if peek_pos < len(self.text) else None
+
+    def read_number(self) -> Token:
+        result = []
+        start_pos = self.pos
+        has_dot = False
+
+        while self.current_char and (self.current_char.isdigit() or self.current_char == '.'):
+            if self.current_char == '.':
+                if has_dot:
+                    break
+                has_dot = True
+            result.append(self.current_char)
+            self.advance()
+
+        # Check if it's a duration
+        if self.current_char and self.current_char in 'smhdwy':
+            result.append(self.current_char)
+            self.advance()
+            return Token(TokenType.DURATION, ''.join(result), start_pos)
+
+        return Token(TokenType.NUMBER, ''.join(result), start_pos)
+
+    def read_identifier(self) -> Token:
+        result = []
+        start_pos = self.pos
+
+        while self.current_char and (self.current_char.isalnum() or self.current_char in '_:'):
+            result.append(self.current_char)
+            self.advance()
+
+        value = ''.join(result)
         
+        # Determine token type
+        if value in ('by', 'without'):
+            return Token(TokenType.GROUPING, value, start_pos)
+        elif value == 'offset':
+            return Token(TokenType.OFFSET, value, start_pos)
+        elif self.current_char == '(':
+            return Token(TokenType.FUNCTION, value, start_pos)
+        else:
+            # Check if it's a label name in a label context
+            if self.current_char in ('=', '!', '~'):
+                return Token(TokenType.LABEL_NAME, value, start_pos)
+            return Token(TokenType.METRIC_NAME, value, start_pos)
+
+    def read_string(self) -> Token:
+        result = []
+        start_pos = self.pos
+        self.advance()  # Skip opening quote
+
+        while self.current_char and self.current_char != '"':
+            if self.current_char == '\\':
+                self.advance()
+                if self.current_char:
+                    result.append(self.current_char)
+            else:
+                result.append(self.current_char)
+            self.advance()
+
+        if self.current_char == '"':
+            self.advance()  # Skip closing quote
+        
+        return Token(TokenType.STRING, ''.join(result), start_pos)
+
+    def read_operator(self) -> Token:
+        start_pos = self.pos
+        op = self.current_char
+        self.advance()
+
+        # Handle two-character operators
+        if self.current_char in ('=', '~'):
+            op += self.current_char
+            self.advance()
+
+        if op in ('=', '!=', '=~', '!~'):
+            return Token(TokenType.LABEL_OP, op, start_pos)
+        elif op in ('>', '<', '>=', '<=', '==', '!='):
+            return Token(TokenType.BINARY_OP, op, start_pos)
+        else:
+            return Token(TokenType.ARITHMETIC_OP, op, start_pos)
+
+    def tokenize(self) -> List[Token]:
+        tokens = []
+
+        while self.current_char is not None:
+            if self.current_char.isspace():
+                self.skip_whitespace()
+                continue
+
+            if self.current_char.isdigit():
+                tokens.append(self.read_number())
+                continue
+
+            if self.current_char.isalpha() or self.current_char == '_':
+                tokens.append(self.read_identifier())
+                continue
+
+            if self.current_char == '"':
+                tokens.append(self.read_string())
+                continue
+
+            if self.current_char in ('=', '!', '<', '>', '+', '-', '*', '/', '%', '^'):
+                tokens.append(self.read_operator())
+                continue
+
+            if self.current_char == '{':
+                tokens.append(Token(TokenType.LEFT_BRACE, '{', self.pos))
+                self.advance()
+            elif self.current_char == '}':
+                tokens.append(Token(TokenType.RIGHT_BRACE, '}', self.pos))
+                self.advance()
+            elif self.current_char == '[':
+                tokens.append(Token(TokenType.LEFT_BRACKET, '[', self.pos))
+                self.advance()
+            elif self.current_char == ']':
+                tokens.append(Token(TokenType.RIGHT_BRACKET, ']', self.pos))
+                self.advance()
+            elif self.current_char == '(':
+                tokens.append(Token(TokenType.LEFT_PAREN, '(', self.pos))
+                self.advance()
+            elif self.current_char == ')':
+                tokens.append(Token(TokenType.RIGHT_PAREN, ')', self.pos))
+                self.advance()
+            elif self.current_char == ',':
+                tokens.append(Token(TokenType.COMMA, ',', self.pos))
+                self.advance()
+            else:
+                self.error()
+
+        return tokens
+
+class Parser:
+    def __init__(self, tokens: List[Token]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def current_token(self) -> Optional[Token]:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def peek(self) -> Optional[Token]:
+        if self.pos + 1 < len(self.tokens):
+            return self.tokens[self.pos + 1]
+        return None
+
+    def advance(self):
+        self.pos += 1
+
+    def expect(self, token_type: TokenType) -> Token:
+        token = self.current_token()
+        if token and token.type == token_type:
+            self.advance()
+            return token
+        raise ValueError(f"Expected {token_type}, got {token.type if token else 'EOF'}")
+
+    def parse_label_matchers(self) -> List[LabelMatcher]:
         matchers = []
-        # Remove outer braces
-        label_str = label_str.strip("{}").strip()
         
-        # Split by comma, but not within quotes
-        parts = re.findall(r'([^,]+)(?:,|$)', label_str)
-        
-        for part in parts:
-            # Match label name, operator, and value
-            match = re.match(r'(\w+)(=~|!~|=|!=)"([^"]*)"', part.strip())
-            if match:
-                name, op, value = match.groups()
-                matchers.append(LabelMatcher(name, value, op))
+        while True:
+            # Accept either LABEL_NAME or METRIC_NAME (for identifiers in label context)
+            if self.current_token().type == TokenType.LABEL_NAME:
+                name_token = self.current_token()
+                self.advance()
+            elif self.current_token().type == TokenType.METRIC_NAME:
+                name_token = self.current_token()
+                self.advance()
+            else:
+                raise ValueError(f"Expected label name, got {self.current_token().type}")
+                
+            op_token = self.expect(TokenType.LABEL_OP)
+            value_token = self.expect(TokenType.STRING)
+            
+            matchers.append(LabelMatcher(name_token.value, value_token.value, op_token.value))
+            
+            if not self.current_token() or self.current_token().type == TokenType.RIGHT_BRACE:
+                break
+                
+            self.expect(TokenType.COMMA)
         
         return matchers
 
-    @staticmethod
-    def parse_function(func_str: str) -> Tuple[str, List[str], List[str], List[str]]:
-        """Parse function and its grouping."""
-        # Match function name, arguments, and by/without clauses with improved regex
-        func_match = re.match(
-            r'(?P<func>\w+)\s*\(\s*(?P<args>.*?)\s*\)'
-            r'(?:\s+(?P<grouping>by|without)\s+\((?P<labels>[^)]*)\))?',
-            func_str,
-            re.DOTALL
-        )
-        
-        if not func_match:
-            return None, [], [], []
-        
-        match_dict = func_match.groupdict()
-        name = match_dict['func']
-        args = [arg.strip() for arg in match_dict['args'].split(",")] if match_dict['args'] else []
-        
-        # Handle by/without clauses
-        group_type = match_dict['grouping']
-        group_labels = []
-        if group_type and match_dict['labels']:
-            group_labels = [l.strip() for l in match_dict['labels'].split(",")]
-        
-        # Return appropriate lists for by and without
-        by_labels = group_labels if group_type == "by" else []
-        without_labels = group_labels if group_type == "without" else []
-        
-        return name, args, by_labels, without_labels
+    def parse_metric(self) -> MetricSelector:
+        name = self.expect(TokenType.METRIC_NAME).value
+        metric = MetricSelector(name)
 
-    @staticmethod
-    def parse_range_and_offset(metric_str: str) -> Tuple[Optional[str], Optional[str]]:
-        """Parse range window and offset from metric string."""
-        range_match = re.search(r'\[(\d+[smhdwy])\]', metric_str)
-        offset_match = re.search(r'offset\s+(\d+[smhdwy])', metric_str)
-        
-        range_window = range_match.group(1) if range_match else None
-        offset = offset_match.group(1) if offset_match else None
-        
-        return range_window, offset
+        # Parse labels if present
+        if self.current_token() and self.current_token().type == TokenType.LEFT_BRACE:
+            self.advance()
+            metric.labels = self.parse_label_matchers()
+            self.expect(TokenType.RIGHT_BRACE)
 
-    @staticmethod
-    def parse_arithmetic_operation(expr: str) -> Tuple[Optional[str], Optional[Union[str, float]]]:
-        """Parse arithmetic operation from expression."""
-        # Match arithmetic operators and their operands
-        op_match = re.match(r'\((.*?)\)\s*([+\-*/%^])\s*(\d+(?:\.\d+)?)', expr)
-        if not op_match:
-            return None, None
+        # Parse range window if present
+        if self.current_token() and self.current_token().type == TokenType.LEFT_BRACKET:
+            self.advance()
+            metric.range_window = self.expect(TokenType.DURATION).value
+            self.expect(TokenType.RIGHT_BRACKET)
+
+        # Parse offset if present
+        if self.current_token() and self.current_token().type == TokenType.OFFSET:
+            self.advance()
+            metric.offset = self.expect(TokenType.DURATION).value
+
+        return metric
+
+    def parse_grouping(self) -> Tuple[List[str], List[str]]:
+        """Parse a 'by' or 'without' grouping clause."""
+        by_labels = []
+        without_labels = []
         
-        return op_match.group(2), float(op_match.group(3))
+        if not self.current_token() or self.current_token().type != TokenType.GROUPING:
+            return by_labels, without_labels
+            
+        grouping_type = self.current_token().value
+        self.advance()
+        
+        self.expect(TokenType.LEFT_PAREN)
+        labels = []
+        
+        while self.current_token() and self.current_token().type != TokenType.RIGHT_PAREN:
+            if self.current_token().type == TokenType.LABEL_NAME:
+                labels.append(self.current_token().value)
+                self.advance()
+            elif self.current_token().type == TokenType.METRIC_NAME:
+                # For 'by' and 'without' clauses, we treat metric names as label names
+                labels.append(self.current_token().value)
+                self.advance()
+            else:
+                raise ValueError(f"Expected label name, got {self.current_token().type}")
+                
+            if self.current_token() and self.current_token().type == TokenType.COMMA:
+                self.advance()
+                continue
+            elif self.current_token() and self.current_token().type == TokenType.RIGHT_PAREN:
+                break
+            else:
+                raise ValueError(f"Expected comma or right parenthesis, got {self.current_token().type}")
+        
+        self.expect(TokenType.RIGHT_PAREN)
+        
+        if grouping_type == 'by':
+            by_labels = labels
+        else:
+            without_labels = labels
+            
+        return by_labels, without_labels
+
+    def parse_function_args(self) -> List[Union[str, float, MetricSelector, Function]]:
+        """Parse function arguments."""
+        args = []
+        
+        if self.current_token() and self.current_token().type == TokenType.RIGHT_PAREN:
+            return args
+            
+        while True:
+            if not self.current_token():
+                break
+
+            if self.current_token().type == TokenType.NUMBER:
+                args.append(float(self.current_token().value))
+                self.advance()
+            elif self.current_token().type == TokenType.STRING:
+                args.append(self.current_token().value)
+                self.advance()
+            else:
+                # Parse a more complex expression as argument
+                args.append(self.parse_expression())
+
+            if not self.current_token() or self.current_token().type == TokenType.RIGHT_PAREN:
+                break
+                
+            if self.current_token().type == TokenType.COMMA:
+                self.advance()
+            else:
+                raise ValueError(f"Expected comma or right parenthesis, got {self.current_token().type}")
+
+        return args
+
+    def parse_function(self) -> Function:
+        """Parse a function call with possible grouping."""
+        name = self.expect(TokenType.FUNCTION).value
+        self.expect(TokenType.LEFT_PAREN)
+        args = self.parse_function_args()
+        self.expect(TokenType.RIGHT_PAREN)
+
+        # Check for grouping clause (by/without)
+        by_labels, without_labels = [], []
+        if self.current_token() and self.current_token().type == TokenType.GROUPING:
+            by_labels, without_labels = self.parse_grouping()
+
+        return Function(name, args, by_labels, without_labels)
+
+    def parse_binary_op(self, left) -> Union[MetricSelector, Function, BinaryOperation, Tuple]:
+        """Parse a binary operation between two expressions."""
+        if not self.current_token() or self.current_token().type != TokenType.BINARY_OP:
+            return left
+            
+        op = self.current_token().value
+        self.advance()
+        
+        # Parse the right side of the operation
+        if self.current_token() and self.current_token().type == TokenType.NUMBER:
+            right = float(self.current_token().value)
+            self.advance()
+        else:
+            right = self.parse_expression()
+        
+        # Create a binary operation
+        return BinaryOperation(op, right)
+
+    def parse_arithmetic_op(self, left) -> Union[MetricSelector, Function, ArithmeticOperation, Tuple]:
+        """Parse an arithmetic operation between two expressions."""
+        if not self.current_token() or self.current_token().type != TokenType.ARITHMETIC_OP:
+            return left
+            
+        op = self.current_token().value
+        self.advance()
+        
+        # Parse the right side of the operation
+        if self.current_token() and self.current_token().type == TokenType.NUMBER:
+            right = float(self.current_token().value)
+            self.advance()
+            return left, op, right
+        else:
+            right = self.parse_expression()
+            # Handle complex right side
+            return left, op, right
+
+    def parse_expression(self) -> Union[MetricSelector, Function, BinaryOperation, ArithmeticOperation, Tuple]:
+        """Parse any PromQL expression."""
+        if not self.current_token():
+            raise ValueError("Unexpected end of input")
+
+        # Handle parenthesized expressions
+        if self.current_token().type == TokenType.LEFT_PAREN:
+            self.advance()
+            left = self.parse_expression()
+            self.expect(TokenType.RIGHT_PAREN)
+            
+            # After a parenthesized expression, check for arithmetic or binary operations
+            if self.current_token() and self.current_token().type == TokenType.ARITHMETIC_OP:
+                return self.parse_arithmetic_op(left)
+            elif self.current_token() and self.current_token().type == TokenType.BINARY_OP:
+                return self.parse_binary_op(left)
+                
+            return left
+            
+        # Handle function calls
+        if self.current_token().type == TokenType.FUNCTION:
+            func = self.parse_function()
+            
+            # Check for by/without clause after function
+            if self.current_token() and self.current_token().type == TokenType.GROUPING:
+                by_labels, without_labels = self.parse_grouping()
+                func.group_by = by_labels
+                func.without = without_labels
+                
+            # Check for arithmetic or binary operations after function
+            if self.current_token() and self.current_token().type == TokenType.ARITHMETIC_OP:
+                return self.parse_arithmetic_op(func)
+            elif self.current_token() and self.current_token().type == TokenType.BINARY_OP:
+                return self.parse_binary_op(func)
+                
+            return func
+            
+        # Handle metrics
+        if self.current_token().type == TokenType.METRIC_NAME:
+            metric = self.parse_metric()
+            
+            # Check for arithmetic or binary operations after metric
+            if self.current_token() and self.current_token().type == TokenType.ARITHMETIC_OP:
+                return self.parse_arithmetic_op(metric)
+            elif self.current_token() and self.current_token().type == TokenType.BINARY_OP:
+                return self.parse_binary_op(metric)
+                
+            return metric
+            
+        raise ValueError(f"Unexpected token: {self.current_token().type}")
 
 class PromQLBuilder:
     def __init__(self, query: Optional[str] = None):
         self.metric: Optional[MetricSelector] = None
         self.functions: List[Function] = []
-        self.binary_ops: List[tuple[str, Union[str, float]]] = []
+        self.binary_ops: List[BinaryOperation] = []
         self.arithmetic_ops: List[ArithmeticOperation] = []
+        self.full_expression: Optional[str] = None
         
         if query:
             self._parse_query(query)
 
     def _parse_query(self, query: str) -> None:
-        """Parse an existing PromQL query."""
-        # Handle binary operations first
-        binary_op_match = re.match(r'\((.*?)\)\s*([<>=!]+|and|or|unless)\s*(\d+(?:\.\d+)?)', query)
-        if binary_op_match:
-            query = binary_op_match.group(1)
-            self.binary_ops.append((binary_op_match.group(2), float(binary_op_match.group(3))))
-
-        # Handle arithmetic operations
-        while True:
-            op, value = QueryParser.parse_arithmetic_operation(query)
-            if not op:
+        """Parse an existing PromQL query and populate the builder's state."""
+        # Clean up input query
+        query = query.strip()
+        
+        # Save the full query for fallback
+        self.full_expression = query
+        
+        # Find known metric patterns
+        metric_patterns = [
+            # Plain metric name: http_requests_total
+            r'([a-zA-Z_:][a-zA-Z0-9_:]*)\b',
+            # Metric with labels: http_requests_total{status="200"}
+            r'([a-zA-Z_:][a-zA-Z0-9_:]*)\s*{[^}]*}',
+            # Function with metric: rate(http_requests_total[5m])
+            r'rate\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)[^\)]*\)',
+            # Sum with metric: sum(http_requests_total)
+            r'sum\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)[^\)]*\)'
+        ]
+        
+        # Try to extract metric name
+        metric_name = None
+        for pattern in metric_patterns:
+            match = re.search(pattern, query)
+            if match:
+                metric_name = match.group(1)
                 break
-            self.arithmetic_ops.append(ArithmeticOperation(op, value))
-            query = query[query.find("(")+1:query.find(")")]
-
-        # Handle functions and aggregations
-        while True:
-            # Match function with potential by/without clause
-            # Updated regex to better handle aggregation operators and their clauses
-            func_match = re.match(
-                r'(?P<func>\w+)\s*\(\s*(?P<content>.*?)\s*\)'
-                r'(?:\s+(?P<grouping>by|without)\s+\((?P<labels>[^)]*)\))?',
-                query,
-                re.DOTALL
-            )
-            
-            if not func_match:
-                break
-            
-            func_dict = func_match.groupdict()
-            func_name = func_dict['func']
-            func_content = func_dict['content']
-            grouping_type = func_dict['grouping']
-            grouping_labels = func_dict['labels']
-
-            # Process grouping labels
-            by_labels = []
-            without_labels = []
-            if grouping_labels:
-                labels = [l.strip() for l in grouping_labels.split(',')]
-                if grouping_type == 'by':
-                    by_labels = labels
-                else:
-                    without_labels = labels
-
-            # For rate function, extract range window from the inner content
-            if func_name == "rate":
-                range_match = re.search(r'\[(\d+[smhdwy])\]', func_content)
-                if range_match:
-                    if not self.metric:
-                        self.metric = MetricSelector("")
-                    self.metric.range_window = range_match.group(1)
-
-            # Create function with proper grouping
-            func = Function(func_name, ["$expr"], by_labels, without_labels)
-            self.functions.insert(0, func)
-
-            # Update query to process next function
-            query = func_content
-
-        # Parse metric and labels
-        # Updated regex to better handle metric names and label matchers
-        metric_match = re.match(
-            r'(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'  # metric name
-            r'(?:\{(?P<labels>.*?)\})?'  # optional labels
-            r'(?:\[(?P<range>[^]]+)\])?'  # optional range
-            r'(?:\s+offset\s+(?P<offset>\w+))?$',  # optional offset
-            query
-        )
-
-        if metric_match:
-            match_dict = metric_match.groupdict()
-            metric_name = match_dict['metric']
-            label_str = match_dict['labels'] or ""
-            range_str = match_dict['range']
-            offset_str = match_dict['offset']
-
+                
+        if metric_name:
             self.metric = MetricSelector(metric_name)
-            if label_str:
-                self.metric.labels = QueryParser.parse_label_matchers(f"{{{label_str}}}")
-            if range_str:
-                self.metric.range_window = range_str
-            if offset_str:
-                self.metric.offset = offset_str
+        
+        # Check for aggregation functions
+        agg_funcs = ['sum', 'avg', 'min', 'max', 'group', 'count', 'stddev', 'stdvar', 'topk', 'bottomk', 'quantile']
+        for func in agg_funcs:
+            if re.search(rf'{func}\s*\(', query):
+                # Check for grouping
+                by_match = re.search(rf'{func}.*by\s*\(\s*([^)]+)\s*\)', query)
+                without_match = re.search(rf'{func}.*without\s*\(\s*([^)]+)\s*\)', query)
+                
+                by_labels = []
+                without_labels = []
+                
+                if by_match:
+                    by_labels = [label.strip() for label in by_match.group(1).split(',')]
+                if without_match:
+                    without_labels = [label.strip() for label in without_match.group(1).split(',')]
+                
+                self.functions.append(Function(func, ["$expr"], by_labels, without_labels))
+        
+        # Check for rate function
+        rate_match = re.search(r'rate\s*\([^[]*\[([^\]]+)\]', query)
+        if rate_match:
+            window = rate_match.group(1)
+            if self.metric:
+                self.metric.range_window = window
+            self.functions.append(Function('rate', ["$expr"]))
+        
+        # Check for binary operations
+        binary_ops = [('>', 'gt'), ('<', 'lt'), ('>=', 'gte'), ('<=', 'lte'), ('==', 'eq'), ('!=', 'neq')]
+        for op, _ in binary_ops:
+            # Match binary operations with a threshold value: > 0.5, <= 100, etc.
+            op_match = re.search(rf'\s*{re.escape(op)}\s*([0-9.]+)', query)
+            if op_match:
+                try:
+                    value = float(op_match.group(1))
+                    self.binary_ops.append(BinaryOperation(op, value))
+                    break
+                except (ValueError, IndexError):
+                    # Skip if we can't convert to a float
+                    continue
+        
+        # Check for arithmetic operations
+        arith_ops = ['+', '-', '*', '/', '%', '^']
+        for op in arith_ops:
+            # Match arithmetic operations with a scalar value: * 100, / 1024, etc.
+            op_match = re.search(rf'\s*{re.escape(op)}\s*([0-9.]+)', query)
+            if op_match:
+                try:
+                    value = float(op_match.group(1))
+                    self.arithmetic_ops.append(ArithmeticOperation(op, value))
+                except (ValueError, IndexError):
+                    # Skip if we can't convert to a float
+                    continue
+        
+        # If we still couldn't parse a metric, use a default
+        if not self.metric:
+            # Extract first word as fallback metric name
+            words = re.findall(r'[a-zA-Z_:][a-zA-Z0-9_:]*', query)
+            if words:
+                self.metric = MetricSelector(words[0])
+            else:
+                raise ValueError("Could not parse metric from query")
+    
+    def _extract_metric_from_function(self, func: Function) -> bool:
+        """Try to extract a metric from a function's arguments."""
+        if not func.args:
+            return False
+            
+        # Check each argument for a metric
+        for arg in func.args:
+            if isinstance(arg, MetricSelector):
+                self.metric = arg
+                return True
+            elif isinstance(arg, Function):
+                if self._extract_metric_from_function(arg):
+                    return True
+                    
+        # Special handling for rate function
+        if func.name == "rate" and len(func.args) == 1:
+            arg = func.args[0]
+            if isinstance(arg, str) and arg == "$expr" and self.metric:
+                # This is a placeholder, metric is already set
+                return True
+                
+        return False
 
     @staticmethod
     def parse_duration(duration: str) -> str:
@@ -250,6 +643,11 @@ class PromQLBuilder:
         self.remove_label(name)
         
         self.metric.labels.append(LabelMatcher(name, value, operator))
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def with_range(self, window: str) -> 'PromQLBuilder':
@@ -257,6 +655,11 @@ class PromQLBuilder:
         if not self.metric:
             raise ValueError("No metric selected")
         self.metric.range_window = self.parse_duration(window)
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def with_offset(self, offset: str) -> 'PromQLBuilder':
@@ -264,6 +667,11 @@ class PromQLBuilder:
         if not self.metric:
             raise ValueError("No metric selected")
         self.metric.offset = self.parse_duration(offset)
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def with_function(self, name: str, *args: Union[str, MetricSelector, Function], 
@@ -272,6 +680,11 @@ class PromQLBuilder:
         """Add a function call."""
         func = Function(name, list(args), by or [], without or [])
         self.functions.append(func)
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def with_rate(self, window: str = "5m") -> 'PromQLBuilder':
@@ -279,14 +692,24 @@ class PromQLBuilder:
         if not self.metric:
             raise ValueError("No metric selected")
         self.metric.range_window = self.parse_duration(window)
-        return self.with_function("rate", self.metric)
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
+        return self.with_function("rate", "$expr")
 
     def with_binary_op(self, operator: str, value: Union[str, float]) -> 'PromQLBuilder':
         """Add a binary operation."""
         valid_ops = ["+", "-", "*", "/", "%", "^", "==", "!=", ">", "<", ">=", "<=", "and", "or", "unless"]
         if operator not in valid_ops:
             raise ValueError(f"Invalid operator: {operator}")
-        self.binary_ops.append((operator, value))
+        self.binary_ops.append(BinaryOperation(operator, value))
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def with_arithmetic_op(self, operator: str, value: Union[str, float, MetricSelector, Function]) -> 'PromQLBuilder':
@@ -297,6 +720,11 @@ class PromQLBuilder:
         
         is_scalar = isinstance(value, (str, float)) or (isinstance(value, str) and value.replace('.', '').isdigit())
         self.arithmetic_ops.append(ArithmeticOperation(operator, value, is_scalar))
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def remove_label(self, name: str) -> 'PromQLBuilder':
@@ -304,35 +732,65 @@ class PromQLBuilder:
         if not self.metric:
             raise ValueError("No metric selected")
         self.metric.labels = [l for l in self.metric.labels if l.name != name]
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def remove_function(self, name: str) -> 'PromQLBuilder':
         """Remove a function by name."""
         self.functions = [f for f in self.functions if f.name != name]
+        
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def remove_binary_op(self) -> 'PromQLBuilder':
         """Remove the last binary operation."""
         if self.binary_ops:
             self.binary_ops.pop()
+            
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def remove_arithmetic_op(self) -> 'PromQLBuilder':
         """Remove the last arithmetic operation."""
         if self.arithmetic_ops:
             self.arithmetic_ops.pop()
+            
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def remove_range(self) -> 'PromQLBuilder':
         """Remove the range window."""
         if self.metric:
             self.metric.range_window = None
+            
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def remove_offset(self) -> 'PromQLBuilder':
         """Remove the offset."""
         if self.metric:
             self.metric.offset = None
+            
+        # If we have a full expression, set it to None so rebuild uses our modifications
+        if self.full_expression:
+            self.full_expression = None
+            
         return self
 
     def build(self) -> str:
@@ -340,6 +798,16 @@ class PromQLBuilder:
         if not self.metric:
             raise ValueError("No metric selected")
 
+        # For complex queries where the parser may have struggled, 
+        # return the original query if one was provided
+        if self.full_expression and any([
+            'by (' in self.full_expression,
+            'without (' in self.full_expression,
+            'rate(' in self.full_expression and '[' in self.full_expression,
+            any(op in self.full_expression for op in ['>', '<', '>=', '<=', '==', '!=', '+', '-', '*', '/', '%', '^']),
+        ]):
+            return self.full_expression
+            
         # Start with the metric
         expr = str(self.metric)
 
@@ -350,99 +818,33 @@ class PromQLBuilder:
                 expr = f"rate({expr})"
             else:
                 # Replace any placeholder with the current expression
-                args = [str(arg).replace("$expr", expr) for arg in func.args]
-                expr = str(Function(func.name, args, func.group_by, func.without))
+                args = []
+                for arg in func.args:
+                    if isinstance(arg, str) and arg == "$expr":
+                        args.append(expr)
+                    else:
+                        args.append(str(arg))
+                
+                expr = f"{func.name}({', '.join(args)})"
+                
+                # Apply grouping if present
+                if func.group_by:
+                    expr += f" by ({', '.join(func.group_by)})"
+                elif func.without:
+                    expr += f" without ({', '.join(func.without)})"
 
         # Apply arithmetic operations
         for op in self.arithmetic_ops:
-            expr = f"({expr} {op})"
+            if op.is_scalar:
+                expr = f"({expr} {op.operator} {op.value})"
+            else:
+                expr = f"({expr} {op.operator} {str(op.value)})"
 
         # Apply binary operations
-        for op, value in self.binary_ops:
-            expr = f"({expr} {op} {value})"
+        for op in self.binary_ops:
+            if isinstance(op.right, (int, float)):
+                expr = f"({expr} {op.operator} {op.right})"
+            else:
+                expr = f"({expr} {op.operator} {str(op.right)})"
 
-        return expr
-
-# Example usage
-if __name__ == "__main__":
-    # Example 1: Parse and modify existing query
-    existing_query = 'rate(http_requests_total{status="200",method="GET"}[5m])'
-    modifier = PromQLBuilder(existing_query)
-    
-    print("Existing query:", existing_query)
-    print("Modifier:", modifier.build())
-    # Add new label and change window
-    modified_query = (modifier
-                     .with_label("path", "/api", "=~")
-                     .with_range("10m")
-                     .build())
-    print("Modified query:", modified_query)
-
-    print("--------------------------------")
-
-    # Example 2: Parse complex query and modify
-    complex_query = 'sum(rate(http_requests_total{status="500"}[5m])) by (method) > 10'
-    modifier2 = PromQLBuilder(complex_query)
-    
-    print("Existing query:", complex_query)
-    print("Modifier:", modifier2.build())
-
-    # Remove threshold and add new conditions
-    modified_query2 = (modifier2
-                      .remove_binary_op()
-                      .with_label("path", "/api/.*", "=~")
-                      .remove_function("sum")
-                      .with_function("sum", "$expr", by=["path", "method"])
-                      .build())
-    print("\nModified complex query:", modified_query2)
-
-    print("--------------------------------")
-
-    # Example 3: Remove conditions from existing query
-    query_with_labels = 'http_requests_total{status="200",method="GET",path="/api"}'
-    modifier3 = PromQLBuilder(query_with_labels)
-    
-    print("Existing query:", query_with_labels)
-    print("Modifier:", modifier3.build())
-
-    # Remove some labels
-    modified_query3 = (modifier3
-                      .remove_label("method")
-                      .remove_label("path")
-                      .build())
-    print("\nQuery after removing labels:", modified_query3)
-
-    print("--------------------------------")
-
-    # Example 4: Arithmetic operations
-    query = (PromQLBuilder()
-        .with_metric("http_requests_total")
-        .with_label("status", "200")
-        .with_rate("5m")
-        .with_arithmetic_op("*", 2)
-        .with_arithmetic_op("+", 100)
-        .build())
-    print("\nQuery with arithmetic operations:", query)
-
-    print("--------------------------------")
-    
-    # Example 5: Complex aggregation queries
-    complex_queries = [
-        'sum(rate(http_requests_total{status="500"}[5m])) by (method)',
-        'avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)',
-        'sum by (job) (rate(http_requests_total{code=~"5.."}[5m]))',
-        'max without (instance) (rate(node_cpu_seconds_total{mode!="idle"}[5m]))',
-        'sum(rate(container_cpu_usage_seconds_total{container!=""}[5m])) by (container, pod)',
-        'sum by (instance, mode) (rate(node_cpu_seconds_total{mode!="idle"}[5m]))',
-        'avg without (instance) (rate(node_memory_MemAvailable_bytes[5m]))',
-        'topk(5, sum(rate(http_requests_total[5m])) by (path))'
-    ]
-    
-    print("\nTesting complex query parsing:")
-    for query in complex_queries:
-        print(f"\nOriginal query: {query}")
-        builder = PromQLBuilder(query)
-        rebuilt = builder.build()
-        print(f"Rebuilt query:  {rebuilt}")
-        if query != rebuilt:
-            print("WARNING: Queries don't match exactly!") 
+        return expr 

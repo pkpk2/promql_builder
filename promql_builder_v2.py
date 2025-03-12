@@ -85,32 +85,64 @@ class Lexer:
             if self.current_char.isspace():
                 self.skip_whitespace()
                 continue
-                
+            
+            if self.current_char.isdigit():
+                tokens.append(self.read_number())
+                continue
+            
             if self.current_char.isalpha() or self.current_char == '_':
                 tokens.append(self.read_identifier())
                 continue
-
+            
             if self.current_char == '"':
-                start_pos = self.pos
-                value = self.read_string()
-                tokens.append(Token(TokenType.LABEL_VALUE, value, start_pos))
+                tokens.append(self.read_string())
                 continue
-
+            
+            # Handle operators
             if self.current_char in '+-*/%^':
                 tokens.append(Token(TokenType.ARITHMETIC_OP, self.current_char, self.pos))
-                self.advance()
-                continue
-
-            # Add more token handling...
-            if self.current_char == '{':
+            elif self.current_char in '<>=!':
+                tokens.append(self.read_comparison_operator())
+            elif self.current_char == '{':
                 tokens.append(Token(TokenType.LEFT_BRACE, '{', self.pos))
             elif self.current_char == '}':
                 tokens.append(Token(TokenType.RIGHT_BRACE, '}', self.pos))
-            # ... etc.
-
+            elif self.current_char == '[':
+                tokens.append(Token(TokenType.LEFT_BRACKET, '[', self.pos))
+            elif self.current_char == ']':
+                tokens.append(Token(TokenType.RIGHT_BRACKET, ']', self.pos))
+            elif self.current_char == '(':
+                tokens.append(Token(TokenType.LEFT_PAREN, '(', self.pos))
+            elif self.current_char == ')':
+                tokens.append(Token(TokenType.RIGHT_PAREN, ')', self.pos))
+            elif self.current_char == ',':
+                tokens.append(Token(TokenType.COMMA, ',', self.pos))
+            
             self.advance()
-
+        
         return tokens
+
+    def read_number(self) -> Token:
+        """Read a number token."""
+        result = []
+        start_pos = self.pos
+        
+        while self.current_char and (self.current_char.isdigit() or self.current_char == '.'):
+            result.append(self.current_char)
+            self.advance()
+        
+        return Token(TokenType.NUMBER, ''.join(result), start_pos)
+
+    def read_comparison_operator(self) -> Token:
+        """Read a comparison operator token."""
+        result = []
+        start_pos = self.pos
+        
+        while self.current_char and self.current_char in '<>=!':
+            result.append(self.current_char)
+            self.advance()
+        
+        return Token(TokenType.BINARY_OP, ''.join(result), start_pos)
 
 @dataclass
 class LabelMatcher:
@@ -211,12 +243,50 @@ class Parser:
             raise ValueError(f"Invalid duration format: {duration}")
         return duration
 
+    def parse_metric(self) -> MetricSelector:
+        """Parse a metric selector with labels, range, and offset."""
+        name = self.expect(TokenType.METRIC_NAME).value
+        metric = MetricSelector(name)
+        
+        # Parse labels if present
+        if self.match(TokenType.LEFT_BRACE):
+            metric.labels = self.parse_labels()
+            self.expect(TokenType.RIGHT_BRACE)
+        
+        # Parse range window if present
+        if self.match(TokenType.LEFT_BRACKET):
+            metric.range_window = self.parse_duration()
+            self.expect(TokenType.RIGHT_BRACKET)
+        
+        # Parse offset if present
+        if self.match(TokenType.OFFSET):
+            metric.offset = self.parse_duration()
+        
+        return metric
+
+    def parse_function_args(self) -> List[Union[str, MetricSelector, Function]]:
+        """Parse function arguments."""
+        args = []
+        while True:
+            if self.current_token().type == TokenType.NUMBER:
+                args.append(float(self.current_token().value))
+                self.advance()
+            else:
+                arg = self.parse_term()
+                args.append(arg)
+            
+            if not self.match(TokenType.COMMA):
+                break
+        return args
+
     def parse_function(self) -> Function:
+        """Parse a function call with its arguments and grouping."""
         name = self.expect(TokenType.FUNCTION).value
         self.expect(TokenType.LEFT_PAREN)
         args = self.parse_function_args()
         self.expect(TokenType.RIGHT_PAREN)
-
+        
+        # Parse grouping if present
         by_labels = []
         without_labels = []
         
@@ -230,17 +300,8 @@ class Parser:
                 by_labels = labels
             else:
                 without_labels = labels
-
+        
         return Function(name, args, by_labels, without_labels)
-
-    def parse_function_args(self) -> List[str]:
-        args = []
-        while True:
-            arg = self.parse_expression()
-            args.append(arg)
-            if not self.match(TokenType.COMMA):
-                break
-        return args
 
     def parse_label_list(self) -> List[str]:
         labels = []
@@ -249,6 +310,39 @@ class Parser:
             if not self.match(TokenType.COMMA):
                 break
         return labels
+
+    def parse_expression(self):
+        """Parse a complete PromQL expression."""
+        # Handle binary operations
+        expr = self.parse_term()
+        
+        while self.current_token() and self.current_token().type == TokenType.BINARY_OP:
+            op = self.current_token().value
+            self.advance()
+            value = self.expect(TokenType.NUMBER).value
+            return expr, op, float(value)
+        
+        return expr, None, None
+
+    def parse_term(self):
+        """Parse a term (metric selector, function call, or parenthesized expression)."""
+        if self.match(TokenType.LEFT_PAREN):
+            expr = self.parse_expression()
+            self.expect(TokenType.RIGHT_PAREN)
+            
+            # Check for arithmetic operations
+            if self.current_token() and self.current_token().type == TokenType.ARITHMETIC_OP:
+                op = self.current_token().value
+                self.advance()
+                value = self.expect(TokenType.NUMBER).value
+                return expr, op, float(value)
+            
+            return expr
+        
+        if self.current_token() and self.current_token().type == TokenType.FUNCTION:
+            return self.parse_function()
+        
+        return self.parse_metric()
 
 class PromQLBuilder:
     def __init__(self, query: Optional[str] = None):
@@ -261,12 +355,89 @@ class PromQLBuilder:
             self._parse_query(query)
 
     def _parse_query(self, query: str) -> None:
+        """Parse an existing PromQL query and populate the builder's state."""
+        # Clean up input query
+        query = query.strip()
+        
+        # Create lexer and parser
         lexer = Lexer(query)
         tokens = lexer.tokenize()
         parser = Parser(tokens)
         
-        # Parse the query and populate the builder's state
-        # Implementation here...
+        # Add parse_expression method to Parser class to handle the full query
+        def parse_expression(self):
+            """Parse a complete PromQL expression."""
+            # Handle binary operations
+            expr = self.parse_term()
+            
+            while self.current_token() and self.current_token().type == TokenType.BINARY_OP:
+                op = self.current_token().value
+                self.advance()
+                value = self.expect(TokenType.NUMBER).value
+                return expr, op, float(value)
+            
+            return expr, None, None
+
+        def parse_term(self):
+            """Parse a term (metric selector, function call, or parenthesized expression)."""
+            if self.match(TokenType.LEFT_PAREN):
+                expr = self.parse_expression()
+                self.expect(TokenType.RIGHT_PAREN)
+                
+                # Check for arithmetic operations
+                if self.current_token() and self.current_token().type == TokenType.ARITHMETIC_OP:
+                    op = self.current_token().value
+                    self.advance()
+                    value = self.expect(TokenType.NUMBER).value
+                    return expr, op, float(value)
+                
+                return expr
+            
+            if self.current_token() and self.current_token().type == TokenType.FUNCTION:
+                return self.parse_function()
+            
+            return self.parse_metric()
+
+        Parser.parse_expression = parse_expression
+        Parser.parse_term = parse_term
+
+        # Parse the complete query
+        try:
+            result = parser.parse_expression()
+            
+            # Handle different types of results
+            if isinstance(result, tuple):
+                expr, op, value = result
+                if op in ["+", "-", "*", "/", "%", "^"]:
+                    self.arithmetic_ops.append(ArithmeticOperation(op, value))
+                elif op:  # Binary operation
+                    self.binary_ops.append((op, value))
+                
+                if isinstance(expr, MetricSelector):
+                    self.metric = expr
+                elif isinstance(expr, Function):
+                    self.functions.append(expr)
+                    if expr.name == "rate" and expr.args:
+                        # Extract metric from rate function
+                        metric_arg = expr.args[0]
+                        if isinstance(metric_arg, MetricSelector):
+                            self.metric = metric_arg
+            elif isinstance(result, MetricSelector):
+                self.metric = result
+            elif isinstance(result, Function):
+                self.functions.append(result)
+                # Handle special case for rate function
+                if result.name == "rate" and result.args:
+                    metric_arg = result.args[0]
+                    if isinstance(metric_arg, MetricSelector):
+                        self.metric = metric_arg
+
+        except Exception as e:
+            raise ValueError(f"Failed to parse query: {str(e)}")
+
+        # If we couldn't parse a metric, raise an error
+        if not self.metric:
+            raise ValueError("Could not parse metric from query")
 
     @staticmethod
     def parse_duration(duration: str) -> str:
@@ -403,3 +574,9 @@ class PromQLBuilder:
             expr = f"({expr} {op} {value})"
 
         return expr 
+
+queries = [
+    'sum by (job) (rate(http_requests_total{status="500"}[5m]))',
+    'histogram_quantile(0.95, sum(rate(http_duration_seconds_bucket[5m])) by (le))',
+    '(sum(rate(errors[5m])) / sum(rate(requests[5m]))) * 100',
+] 

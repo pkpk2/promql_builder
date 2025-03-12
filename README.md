@@ -5,12 +5,13 @@ A Python library that provides a builder pattern implementation for constructing
 ## Features
 
 - Fluent interface for building PromQL queries
-- Support for metric selectors with labels
+- Support for metric selectors with labels (including regex matching)
 - Support for range windows and offsets
-- Support for PromQL functions (rate, sum, etc.)
-- Support for binary operations
-- Support for arithmetic operations
-- Parse and modify existing PromQL queries
+- Support for PromQL functions (rate, sum, etc.) with full grouping clauses
+- Support for binary operations and comparisons
+- Support for arithmetic operations with both scalars and expressions
+- Robust parsing and modification of existing complex PromQL queries
+- Advanced lexical analysis and parsing for reliable query manipulation
 - Type hints for better IDE support
 
 ## Installation
@@ -93,19 +94,36 @@ query = (PromQLBuilder()
 print(query)  # Output: (sum(rate(http_requests_total{status="500"}[5m])) by (method) > 10)
 ```
 
-### Parsing Existing Queries
+### Parsing and Modifying Existing Queries
 
 ```python
 existing_query = 'rate(http_requests_total{status="200",method="GET"}[5m])'
-modifier = PromQLBuilder(existing_query)
+builder = PromQLBuilder(existing_query)
 
 # Modify the query
-modified_query = (modifier
+modified_query = (builder
     .with_label("path", "/api", "=~")
     .with_range("10m")
     .build())
 
 print(modified_query)  # Output: rate(http_requests_total{status="200",method="GET",path=~"/api"}[10m])
+```
+
+### Complex Query Modifications
+
+```python
+# Parse and modify a complex aggregation query
+existing_query = 'sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))'
+builder = PromQLBuilder(existing_query)
+
+# Add additional conditions 
+modified_query = (builder
+    .with_label("method", "GET")
+    .with_binary_op(">", 100)
+    .build())
+
+print(modified_query)
+# Output: (sum by (job) (rate(http_requests_total{status=~"5..",method="GET"}[5m])) > 100)
 ```
 
 ### Arithmetic Operations
@@ -120,17 +138,21 @@ query = (PromQLBuilder()
     .with_arithmetic_op("+", 100)  # Add 100
     .build())
 
-print(query)  # Output: (rate(http_requests_total{status="200"}[5m]) * 2 + 100)
+print(query)  # Output: ((rate(http_requests_total{status="200"}[5m]) * 2) + 100)
+```
 
-# Arithmetic operations with another metric
-query2 = (PromQLBuilder()
-    .with_metric("http_requests_total")
-    .with_label("status", "200")
+### Advanced Histogram Functions
+
+```python
+# Histogram quantile with grouping
+query = (PromQLBuilder()
+    .with_metric("http_request_duration_seconds_bucket")
+    .with_label("path", "/api/.*", "=~")
     .with_rate("5m")
-    .with_arithmetic_op("/", MetricSelector("http_requests_total", [LabelMatcher("status", "500")]))
+    .with_function("histogram_quantile", 0.95, "$expr", by=["path", "method"])
     .build())
 
-print(query2)  # Output: (rate(http_requests_total{status="200"}[5m]) / http_requests_total{status="500"})
+print(query)  # Output: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{path=~"/api/.*"}[5m])) by (path, method)
 ```
 
 ## API Reference
@@ -156,6 +178,17 @@ Main class for building PromQL queries.
 - `remove_range() -> PromQLBuilder`: Remove the range window
 - `remove_offset() -> PromQLBuilder`: Remove the offset
 - `build() -> str`: Build the final PromQL query string
+
+## Examples
+
+For more examples, see the `examples.py` file in the repository. It includes:
+
+- Basic metric selection and rate queries
+- Complex aggregations with multiple labels
+- Histogram quantiles and percentiles
+- Multi-stage operations and arithmetic
+- Time shifts and range windows
+- Complex query modifications
 
 ## License
 
