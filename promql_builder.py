@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple, Dict, Any
 from enum import Enum, auto
 import re
 
@@ -512,16 +512,29 @@ class PromQLBuilder:
         # Save the full query for fallback
         self.full_expression = query
         
-        # Find known metric patterns
+        # Improved metric pattern matching for nested queries
+        # Match patterns from most specific to least specific
         metric_patterns = [
-            # Plain metric name: http_requests_total
-            r'([a-zA-Z_:][a-zA-Z0-9_:]*)\b',
+            # Metric with labels inside rate or function: rate(http_requests_total{status="200"}[5m])
+            r'(?:rate|sum|avg|max|min|count|quantile|stddev|stdvar)\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*{[^}]*}',
+            
+            # Function with metric and range: rate(http_requests_total[5m])
+            r'(?:rate|sum|avg|max|min|count|quantile|stddev|stdvar)\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\[[^\]]*\]',
+            
+            # Plain function with metric: sum(http_requests_total)
+            r'(?:rate|sum|avg|max|min|count|quantile|stddev|stdvar)\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)',
+            
+            # Histogram function: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket)))
+            r'histogram_quantile\s*\(.*?,.*?([a-zA-Z_:][a-zA-Z0-9_:]*)',
+            
             # Metric with labels: http_requests_total{status="200"}
             r'([a-zA-Z_:][a-zA-Z0-9_:]*)\s*{[^}]*}',
-            # Function with metric: rate(http_requests_total[5m])
-            r'rate\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)[^\)]*\)',
-            # Sum with metric: sum(http_requests_total)
-            r'sum\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)[^\)]*\)'
+            
+            # Metric with range: http_requests_total[5m]
+            r'([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\[[^\]]*\]',
+            
+            # Plain metric name: http_requests_total
+            r'([a-zA-Z_:][a-zA-Z0-9_:]*)\b'
         ]
         
         # Try to extract metric name
@@ -532,16 +545,48 @@ class PromQLBuilder:
                 metric_name = match.group(1)
                 break
                 
+        # Create the metric selector
         if metric_name:
             self.metric = MetricSelector(metric_name)
+            
+            # More robust label extraction - look for labels anywhere in the query
+            # First, try to find labels for the specific metric if present
+            metric_labels_pattern = rf'{re.escape(metric_name)}\s*{{([^}}]*)}}' 
+            metric_labels_match = re.search(metric_labels_pattern, query)
+            
+            if metric_labels_match:
+                labels_str = metric_labels_match.group(1)
+                self._parse_labels(labels_str)
+            else:
+                # If no direct metric labels found, look for any labels in curly braces
+                # This helps with complex nested queries
+                labels_matches = re.findall(r'{([^}]*)}', query)
+                for labels_str in labels_matches:
+                    self._parse_labels(labels_str)
+            
+            # Look for range window
+            range_pattern = r'\[([^\]]*)\]'
+            range_match = re.search(range_pattern, query)
+            
+            if range_match:
+                range_window = range_match.group(1)
+                if re.match(r'^\d+[smhdwy]$', range_window):
+                    self.metric.range_window = range_window
+            
+            # Look for offset
+            offset_pattern = r'offset\s+(\d+[smhdwy])'
+            offset_match = re.search(offset_pattern, query)
+            
+            if offset_match:
+                self.metric.offset = offset_match.group(1)
         
         # Check for aggregation functions
         agg_funcs = ['sum', 'avg', 'min', 'max', 'group', 'count', 'stddev', 'stdvar', 'topk', 'bottomk', 'quantile']
         for func in agg_funcs:
             if re.search(rf'{func}\s*\(', query):
                 # Check for grouping
-                by_match = re.search(rf'{func}.*by\s*\(\s*([^)]+)\s*\)', query)
-                without_match = re.search(rf'{func}.*without\s*\(\s*([^)]+)\s*\)', query)
+                by_match = re.search(rf'{func}.*?by\s*\(\s*([^)]+)\s*\)', query)
+                without_match = re.search(rf'{func}.*?without\s*\(\s*([^)]+)\s*\)', query)
                 
                 by_labels = []
                 without_labels = []
@@ -557,9 +602,16 @@ class PromQLBuilder:
         rate_match = re.search(r'rate\s*\([^[]*\[([^\]]+)\]', query)
         if rate_match:
             window = rate_match.group(1)
-            if self.metric:
+            if self.metric and not self.metric.range_window:
                 self.metric.range_window = window
             self.functions.append(Function('rate', ["$expr"]))
+        
+        # Check for histogram_quantile function
+        if 'histogram_quantile' in query:
+            quantile_match = re.search(r'histogram_quantile\s*\(\s*(0\.\d+)', query)
+            if quantile_match:
+                quantile = quantile_match.group(1)
+                self.functions.append(Function('histogram_quantile', [quantile, "$expr"]))
         
         # Check for binary operations
         binary_ops = [('>', 'gt'), ('<', 'lt'), ('>=', 'gte'), ('<=', 'lte'), ('==', 'eq'), ('!=', 'neq')]
@@ -597,28 +649,30 @@ class PromQLBuilder:
             else:
                 raise ValueError("Could not parse metric from query")
     
-    def _extract_metric_from_function(self, func: Function) -> bool:
-        """Try to extract a metric from a function's arguments."""
-        if not func.args:
-            return False
+    def _parse_labels(self, labels_str: str) -> None:
+        """Parse labels from a string and add them to the metric."""
+        if not labels_str.strip() or not self.metric:
+            return
             
-        # Check each argument for a metric
-        for arg in func.args:
-            if isinstance(arg, MetricSelector):
-                self.metric = arg
-                return True
-            elif isinstance(arg, Function):
-                if self._extract_metric_from_function(arg):
-                    return True
-                    
-        # Special handling for rate function
-        if func.name == "rate" and len(func.args) == 1:
-            arg = func.args[0]
-            if isinstance(arg, str) and arg == "$expr" and self.metric:
-                # This is a placeholder, metric is already set
-                return True
-                
-        return False
+        # Match all label pairs in the string
+        # This will work with formats like: status="200",method="GET" or status="200" , method="GET"
+        label_matches = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*([=!]=~?|=~|!~)\s*"([^"]*)"', labels_str)
+        
+        # Create a dictionary to ensure we only keep one label per name (last one wins)
+        deduplicated_labels = {}
+        
+        for label_name, operator, label_value in label_matches:
+            deduplicated_labels[label_name] = (operator, label_value)
+        
+        # Now add all the deduplicated labels to the metric
+        for label_name, (operator, label_value) in deduplicated_labels.items():
+            # First remove any existing label with this name
+            existing_labels = [l for l in self.metric.labels if l.name == label_name]
+            for existing_label in existing_labels:
+                self.metric.labels.remove(existing_label)
+            
+            # Add the new label
+            self.metric.labels.append(LabelMatcher(label_name, label_value, operator))
 
     @staticmethod
     def parse_duration(duration: str) -> str:
@@ -678,8 +732,18 @@ class PromQLBuilder:
                      by: Optional[List[str]] = None, 
                      without: Optional[List[str]] = None) -> 'PromQLBuilder':
         """Add a function call."""
+        # Create the new function
         func = Function(name, list(args), by or [], without or [])
-        self.functions.append(func)
+        
+        # Check if we already have a function with this name
+        existing_func_index = next((i for i, f in enumerate(self.functions) if f.name == name), None)
+        
+        if existing_func_index is not None:
+            # Replace the existing function
+            self.functions[existing_func_index] = func
+        else:
+            # Add the new function
+            self.functions.append(func)
         
         # If we have a full expression, set it to None so rebuild uses our modifications
         if self.full_expression:
@@ -792,6 +856,103 @@ class PromQLBuilder:
             self.full_expression = None
             
         return self
+
+    def get_metric_name(self) -> Optional[str]:
+        """Get the current metric name."""
+        if not self.metric:
+            return None
+        return self.metric.name
+
+    def get_labels(self) -> List[Dict[str, str]]:
+        """Get all labels for the current metric.
+        
+        Returns:
+            A list of dictionaries with keys 'name', 'value', and 'operator'.
+        """
+        if not self.metric or not self.metric.labels:
+            return []
+        
+        return [{'name': label.name, 'value': label.value, 'operator': label.operator} 
+                for label in self.metric.labels]
+
+    def get_label_values(self) -> Dict[str, str]:
+        """Get a dictionary of label names to values.
+        
+        Returns:
+            A dictionary where keys are label names and values are label values.
+        """
+        if not self.metric or not self.metric.labels:
+            return {}
+        
+        return {label.name: label.value for label in self.metric.labels}
+
+    def get_functions(self) -> List[Dict[str, Any]]:
+        """Get all functions applied to the query.
+        
+        Returns:
+            A list of dictionaries with function information.
+        """
+        result = []
+        
+        for func in self.functions:
+            # Convert arguments to string representation for easier consumption
+            args_str = [str(arg) for arg in func.args]
+            
+            func_info = {
+                'name': func.name,
+                'args': args_str,
+                'group_by': func.group_by,
+                'without': func.without
+            }
+            result.append(func_info)
+            
+        return result
+
+    def get_range_window(self) -> Optional[str]:
+        """Get the range window if set."""
+        if not self.metric:
+            return None
+        return self.metric.range_window
+
+    def get_offset(self) -> Optional[str]:
+        """Get the offset if set."""
+        if not self.metric:
+            return None
+        return self.metric.offset
+
+    def get_binary_ops(self) -> List[Dict[str, Any]]:
+        """Get all binary operations.
+        
+        Returns:
+            A list of dictionaries with binary operation information.
+        """
+        return [{'operator': op.operator, 'value': op.right} for op in self.binary_ops]
+
+    def get_arithmetic_ops(self) -> List[Dict[str, Any]]:
+        """Get all arithmetic operations.
+        
+        Returns:
+            A list of dictionaries with arithmetic operation information.
+        """
+        return [{'operator': op.operator, 'value': op.value, 'is_scalar': op.is_scalar} 
+                for op in self.arithmetic_ops]
+
+    def get_query_info(self) -> Dict[str, Any]:
+        """Get comprehensive information about the current query.
+        
+        Returns:
+            A dictionary containing all information about the current query.
+        """
+        return {
+            'metric_name': self.get_metric_name(),
+            'labels': self.get_labels(),
+            'functions': self.get_functions(),
+            'range_window': self.get_range_window(),
+            'offset': self.get_offset(),
+            'binary_ops': self.get_binary_ops(),
+            'arithmetic_ops': self.get_arithmetic_ops(),
+            'full_query': self.build() if self.metric else None
+        }
 
     def build(self) -> str:
         """Build the final PromQL query string."""

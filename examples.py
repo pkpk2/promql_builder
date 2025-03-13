@@ -78,7 +78,7 @@ def run_examples():
         .build())
     print("Programmatically built complex query:", complex_builder)
 
-    # Histogram quantile example
+    # Histogram quantile examplepromql_builder_v2.py
     histogram_query = (PromQLBuilder()
         .with_metric("http_request_duration_seconds_bucket")
         .with_label("path", "/api/.*", "=~")
