@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Union, Tuple, Dict, Any
 from enum import Enum, auto
 import re
+import copy
 
 class TokenType(Enum):
     METRIC_NAME = auto()
@@ -512,151 +513,156 @@ class PromQLBuilder:
         # Save the full query for fallback
         self.full_expression = query
         
-        # Improved metric pattern matching for nested queries
-        # Match patterns from most specific to least specific
-        metric_patterns = [
-            # Metric with labels inside rate or function: rate(http_requests_total{status="200"}[5m])
-            r'(?:rate|sum|avg|max|min|count|quantile|stddev|stdvar)\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*{[^}]*}',
-            
-            # Function with metric and range: rate(http_requests_total[5m])
-            r'(?:rate|sum|avg|max|min|count|quantile|stddev|stdvar)\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\[[^\]]*\]',
-            
-            # Plain function with metric: sum(http_requests_total)
-            r'(?:rate|sum|avg|max|min|count|quantile|stddev|stdvar)\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)',
-            
-            # Histogram function: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket)))
-            r'histogram_quantile\s*\(.*?,.*?([a-zA-Z_:][a-zA-Z0-9_:]*)',
-            
-            # Metric with labels: http_requests_total{status="200"}
-            r'([a-zA-Z_:][a-zA-Z0-9_:]*)\s*{[^}]*}',
-            
-            # Metric with range: http_requests_total[5m]
-            r'([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\[[^\]]*\]',
-            
-            # Plain metric name: http_requests_total
-            r'([a-zA-Z_:][a-zA-Z0-9_:]*)\b'
-        ]
+        # We need to detect function order correctly to preserve it
+        # First check for the common pattern "sum(...) by (...)" and similar aggregations
+        agg_funcs = ['sum', 'avg', 'min', 'max', 'group', 'count', 'stddev', 'stdvar', 'topk', 'bottomk', 'quantile']
+        rate_match = None
         
-        # Try to extract metric name
-        metric_name = None
-        for pattern in metric_patterns:
-            match = re.search(pattern, query)
-            if match:
-                metric_name = match.group(1)
+        # Store functions in correct order (outermost first)
+        functions_to_add = []
+        
+        # Check for aggregation with "by" or "without" clause
+        # First look for the sum(...) by (...) pattern which is more common
+        for func in agg_funcs:
+            # Pattern: sum(...) by (...)
+            # This regex needs to handle nested parentheses within the sum function 
+            sum_by_match = re.search(rf'{func}\s*\(((?:[^()]|\([^()]*\))*)\)\s*by\s*\(\s*([^)]+)\s*\)', query)
+            if sum_by_match:
+                by_labels = [label.strip() for label in sum_by_match.group(2).split(',')]
+                functions_to_add.insert(0, Function(func, ["$expr"], by_labels, []))
                 break
                 
-        # Create the metric selector
-        if metric_name:
-            self.metric = MetricSelector(metric_name)
-            
-            # More robust label extraction - look for labels anywhere in the query
-            # First, try to find labels for the specific metric if present
-            metric_labels_pattern = rf'{re.escape(metric_name)}\s*{{([^}}]*)}}' 
-            metric_labels_match = re.search(metric_labels_pattern, query)
-            
-            if metric_labels_match:
-                labels_str = metric_labels_match.group(1)
-                self._parse_labels(labels_str)
-            else:
-                # If no direct metric labels found, look for any labels in curly braces
-                # This helps with complex nested queries
-                labels_matches = re.findall(r'{([^}]*)}', query)
-                for labels_str in labels_matches:
-                    self._parse_labels(labels_str)
-            
-            # Look for range window
-            range_pattern = r'\[([^\]]*)\]'
-            range_match = re.search(range_pattern, query)
-            
-            if range_match:
-                range_window = range_match.group(1)
-                if re.match(r'^\d+[smhdwy]$', range_window):
-                    self.metric.range_window = range_window
-            
-            # Look for offset
-            offset_pattern = r'offset\s+(\d+[smhdwy])'
-            offset_match = re.search(offset_pattern, query)
-            
-            if offset_match:
-                self.metric.offset = offset_match.group(1)
+            # Pattern: sum by (...) (...)
+            by_sum_match = re.search(rf'{func}\s*by\s*\(\s*([^)]+)\s*\)\s*\(', query)
+            if by_sum_match:
+                by_labels = [label.strip() for label in by_sum_match.group(1).split(',')]
+                functions_to_add.insert(0, Function(func, ["$expr"], by_labels, []))
+                break
+                
+            # Pattern with without: sum(...) without (...)
+            without_match = re.search(rf'{func}.*?without\s*\(\s*([^)]+)\s*\)', query)
+            if without_match:
+                without_labels = [label.strip() for label in without_match.group(1).split(',')]
+                functions_to_add.insert(0, Function(func, ["$expr"], [], without_labels))
+                break
+                
+            # Simple function without grouping: sum(...)
+            simple_func_match = re.search(rf'{func}\s*\(([^)]*)\)', query)
+            if simple_func_match and not sum_by_match and not by_sum_match and not without_match:
+                functions_to_add.insert(0, Function(func, ["$expr"], [], []))
+                break
         
-        # Check for aggregation functions
-        agg_funcs = ['sum', 'avg', 'min', 'max', 'group', 'count', 'stddev', 'stdvar', 'topk', 'bottomk', 'quantile']
-        for func in agg_funcs:
-            if re.search(rf'{func}\s*\(', query):
-                # Check for grouping
-                by_match = re.search(rf'{func}.*?by\s*\(\s*([^)]+)\s*\)', query)
-                without_match = re.search(rf'{func}.*?without\s*\(\s*([^)]+)\s*\)', query)
-                
-                by_labels = []
-                without_labels = []
-                
-                if by_match:
-                    by_labels = [label.strip() for label in by_match.group(1).split(',')]
-                if without_match:
-                    without_labels = [label.strip() for label in without_match.group(1).split(',')]
-                
-                self.functions.append(Function(func, ["$expr"], by_labels, without_labels))
-        
-        # Check for rate function
+        # Check for rate function - should be inside aggregation if both exist
         rate_match = re.search(r'rate\s*\([^[]*\[([^\]]+)\]', query)
         if rate_match:
             window = rate_match.group(1)
-            if self.metric and not self.metric.range_window:
+            
+            # Improved metric pattern matching for nested queries
+            # Match patterns from most specific to least specific
+            metric_patterns = [
+                # Metric with labels inside rate: rate(http_requests_total{status="200"}[5m])
+                r'rate\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*{[^}]*}',
+                
+                # Plain metric with range: rate(http_requests_total[5m])
+                r'rate\s*\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)',
+            ]
+            
+            metric_name = None
+            for pattern in metric_patterns:
+                match = re.search(pattern, query)
+                if match:
+                    metric_name = match.group(1)
+                    break
+            
+            if metric_name:
+                self.metric = MetricSelector(metric_name)
                 self.metric.range_window = window
-            self.functions.append(Function('rate', ["$expr"]))
+                
+                # Extract labels for this metric
+                metric_labels_pattern = rf'{re.escape(metric_name)}\s*{{([^}}]*)}}' 
+                metric_labels_match = re.search(metric_labels_pattern, query)
+                
+                if metric_labels_match:
+                    labels_str = metric_labels_match.group(1)
+                    self._parse_labels(labels_str)
+            
+            # Add rate function in the right order
+            # If we have aggregation, rate should be applied first (inner function)
+            rate_func = Function('rate', ["$expr"])
+            if functions_to_add:
+                # For sum(rate(...)), rate is the inner function
+                functions_to_add.append(rate_func)
+            else:
+                # For just rate(...), it's the only function
+                functions_to_add.insert(0, rate_func)
         
-        # Check for histogram_quantile function
+        # If we haven't found any functions yet, try to extract basic metric info
+        if not functions_to_add and not self.metric:
+            # Try to extract metric name
+            metric_patterns = [
+                # Metric with labels: http_requests_total{status="200"}
+                r'([a-zA-Z_:][a-zA-Z0-9_:]*)\s*{[^}]*}',
+                
+                # Metric with range: http_requests_total[5m]
+                r'([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\[[^\]]*\]',
+                
+                # Plain metric name: http_requests_total
+                r'([a-zA-Z_:][a-zA-Z0-9_:]*)\b'
+            ]
+            
+            metric_name = None
+            for pattern in metric_patterns:
+                match = re.search(pattern, query)
+                if match:
+                    metric_name = match.group(1)
+                    break
+                    
+            # Create the metric selector
+            if metric_name:
+                self.metric = MetricSelector(metric_name)
+                
+                # Extract labels for this metric
+                metric_labels_pattern = rf'{re.escape(metric_name)}\s*{{([^}}]*)}}' 
+                metric_labels_match = re.search(metric_labels_pattern, query)
+                
+                if metric_labels_match:
+                    labels_str = metric_labels_match.group(1)
+                    self._parse_labels(labels_str)
+                
+                # Look for range window
+                range_pattern = r'\[([^\]]*)\]'
+                range_match = re.search(range_pattern, query)
+                
+                if range_match:
+                    range_window = range_match.group(1)
+                    if re.match(r'^\d+[smhdwy]$', range_window):
+                        self.metric.range_window = range_match.group(1)
+                
+                # Look for offset
+                offset_pattern = r'offset\s+(\d+[smhdwy])'
+                offset_match = re.search(offset_pattern, query)
+                
+                if offset_match:
+                    self.metric.offset = offset_match.group(1)
+        
+        # Check for histogram_quantile function - should be outermost if present
         if 'histogram_quantile' in query:
             quantile_match = re.search(r'histogram_quantile\s*\(\s*(0\.\d+)', query)
             if quantile_match:
                 quantile = quantile_match.group(1)
-                self.functions.append(Function('histogram_quantile', [quantile, "$expr"]))
+                functions_to_add.insert(0, Function('histogram_quantile', [quantile, "$expr"]))
         
-        # Check for binary operations
-        binary_ops = [('>', 'gt'), ('<', 'lt'), ('>=', 'gte'), ('<=', 'lte'), ('==', 'eq'), ('!=', 'neq')]
-        for op, _ in binary_ops:
-            # Match binary operations with a threshold value: > 0.5, <= 100, etc.
-            op_match = re.search(rf'\s*{re.escape(op)}\s*([0-9.]+)', query)
-            if op_match:
-                try:
-                    value = float(op_match.group(1))
-                    self.binary_ops.append(BinaryOperation(op, value))
-                    break
-                except (ValueError, IndexError):
-                    # Skip if we can't convert to a float
-                    continue
-        
-        # Check for arithmetic operations
-        arith_ops = ['+', '-', '*', '/', '%', '^']
-        for op in arith_ops:
-            # Match arithmetic operations with a scalar value: * 100, / 1024, etc.
-            op_match = re.search(rf'\s*{re.escape(op)}\s*([0-9.]+)', query)
-            if op_match:
-                try:
-                    value = float(op_match.group(1))
-                    self.arithmetic_ops.append(ArithmeticOperation(op, value))
-                except (ValueError, IndexError):
-                    # Skip if we can't convert to a float
-                    continue
-        
-        # If we still couldn't parse a metric, use a default
-        if not self.metric:
-            # Extract first word as fallback metric name
-            words = re.findall(r'[a-zA-Z_:][a-zA-Z0-9_:]*', query)
-            if words:
-                self.metric = MetricSelector(words[0])
-            else:
-                raise ValueError("Could not parse metric from query")
-    
+        # Add all functions in the correct order
+        self.functions = functions_to_add
+
     def _parse_labels(self, labels_str: str) -> None:
         """Parse labels from a string and add them to the metric."""
         if not labels_str.strip() or not self.metric:
             return
             
         # Match all label pairs in the string
-        # This will work with formats like: status="200",method="GET" or status="200" , method="GET"
-        label_matches = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*([=!]=~?|=~|!~)\s*"([^"]*)"', labels_str)
+        # This regex handles both single and double quotes around label values
+        label_matches = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*([=!]=~?|=~|!~|=)\s*[\'"]([^\'"]*)[\'"]', labels_str)
         
         # Create a dictionary to ensure we only keep one label per name (last one wins)
         deduplicated_labels = {}
@@ -959,21 +965,13 @@ class PromQLBuilder:
         if not self.metric:
             raise ValueError("No metric selected")
 
-        # For complex queries where the parser may have struggled, 
-        # return the original query if one was provided
-        if self.full_expression and any([
-            'by (' in self.full_expression,
-            'without (' in self.full_expression,
-            'rate(' in self.full_expression and '[' in self.full_expression,
-            any(op in self.full_expression for op in ['>', '<', '>=', '<=', '==', '!=', '+', '-', '*', '/', '%', '^']),
-        ]):
-            return self.full_expression
-            
+        # Always build the query from the current state
         # Start with the metric
         expr = str(self.metric)
 
-        # Apply functions in order
-        for func in self.functions:
+        # Apply functions in reverse order - innermost functions first
+        # This is because the functions list is stored with outermost functions first
+        for func in reversed(self.functions):
             if func.name == "rate" and self.metric.range_window:
                 # Special handling for rate to use metric's range window
                 expr = f"rate({expr})"
@@ -1009,3 +1007,50 @@ class PromQLBuilder:
                 expr = f"({expr} {op.operator} {str(op.right)})"
 
         return expr 
+
+    def clone(self) -> 'PromQLBuilder':
+        """Create a new independent copy of this builder.
+        
+        This method creates a deep copy of the current builder, allowing you to branch off
+        and create variations of a query without affecting the original builder. This is
+        useful for:
+        
+        1. Creating template queries that serve as a base for multiple similar queries
+        2. Branching a query to explore different parameters or conditions
+        3. Creating related dashboards with consistent query patterns
+        4. Testing different variations of a query while preserving the original
+        
+        Returns:
+            A new PromQLBuilder instance with the same state as this one, which can be
+            modified independently of the original.
+            
+        Example:
+            ```python
+            # Create a base query
+            base = PromQLBuilder().with_metric("http_requests_total").with_rate("5m")
+            
+            # Clone and modify for different purposes
+            errors = base.clone().with_label("status", "5..", "=~")
+            latency = base.clone().with_metric("http_request_duration_seconds")
+            ```
+        """
+        # Create a new empty builder
+        new_builder = PromQLBuilder()
+        
+        # Copy metric if exists
+        if self.metric:
+            new_builder.metric = copy.deepcopy(self.metric)
+            
+        # Copy functions
+        new_builder.functions = copy.deepcopy(self.functions)
+        
+        # Copy binary operations
+        new_builder.binary_ops = copy.deepcopy(self.binary_ops)
+        
+        # Copy arithmetic operations
+        new_builder.arithmetic_ops = copy.deepcopy(self.arithmetic_ops)
+        
+        # Copy full expression
+        new_builder.full_expression = self.full_expression
+        
+        return new_builder 
